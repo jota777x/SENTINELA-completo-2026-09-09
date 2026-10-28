@@ -1,7 +1,6 @@
 import "@tanstack/react-start/server-only";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { getDb } from "./db.server";
 import { currentSession } from "./auth.server";
 
 export type RecordKind = "occurrences" | "predictions" | "audits" | "contests" | "reports" | "notifications" | "patrols" | "recommendations" | "ai_decisions" | "bias_alerts" | "mitigations" | "models" | "data_quality";
@@ -35,7 +34,6 @@ export type ManagedRecord = {
   protocol?: string;
 };
 
-const db = new DatabaseSync(join(process.cwd(), "data", "sentinela.db"));
 const tables: Record<RecordKind, string> = {
   occurrences: "occurrences", predictions: "predictions", audits: "audits",
   contests: "contests", reports: "reports", notifications: "notifications",
@@ -43,52 +41,22 @@ const tables: Record<RecordKind, string> = {
   bias_alerts: "bias_alerts", mitigations: "mitigations", models: "models", data_quality: "data_quality",
 };
 
-for (const table of Object.values(tables)) {
-  db.exec(`CREATE TABLE IF NOT EXISTS ${table} (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    region TEXT NOT NULL DEFAULT 'Salvador',
-    event_date TEXT NOT NULL,
-    event_time TEXT NOT NULL DEFAULT '',
-    source TEXT NOT NULL DEFAULT 'Institucional',
-    status TEXT NOT NULL DEFAULT 'Pendente',
-    confidence INTEGER NOT NULL DEFAULT 0 CHECK (confidence BETWEEN 0 AND 100),
-    details TEXT NOT NULL DEFAULT '',
-    created_by TEXT NOT NULL REFERENCES users(id),
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  )`);
+type Row = Record<string, unknown>;
+
+async function q(query: string, params: unknown[] = []): Promise<Row[]> {
+  let index = 0;
+  const sql = await getDb();
+  return await sql.unsafe(query.replace(/\?/g, () => `$${++index}`), params as never[]) as unknown as Row[];
 }
 
-const occurrenceColumns = new Set((db.prepare("PRAGMA table_info(occurrences)").all() as { name: string }[]).map((column) => column.name));
-if (!occurrenceColumns.has("priority")) db.exec("ALTER TABLE occurrences ADD COLUMN priority TEXT NOT NULL DEFAULT 'Normal'");
-if (!occurrenceColumns.has("evidence_name")) db.exec("ALTER TABLE occurrences ADD COLUMN evidence_name TEXT");
-if (!occurrenceColumns.has("evidence_type")) db.exec("ALTER TABLE occurrences ADD COLUMN evidence_type TEXT");
-if (!occurrenceColumns.has("evidence_data")) db.exec("ALTER TABLE occurrences ADD COLUMN evidence_data TEXT");
-if (!occurrenceColumns.has("contact_authorized")) db.exec("ALTER TABLE occurrences ADD COLUMN contact_authorized INTEGER NOT NULL DEFAULT 0");
-if (!occurrenceColumns.has("anonymous")) db.exec("ALTER TABLE occurrences ADD COLUMN anonymous INTEGER NOT NULL DEFAULT 0");
-if (!occurrenceColumns.has("latitude")) db.exec("ALTER TABLE occurrences ADD COLUMN latitude REAL");
-if (!occurrenceColumns.has("longitude")) db.exec("ALTER TABLE occurrences ADD COLUMN longitude REAL");
-if (!occurrenceColumns.has("city")) db.exec("ALTER TABLE occurrences ADD COLUMN city TEXT");
-if (!occurrenceColumns.has("state")) db.exec("ALTER TABLE occurrences ADD COLUMN state TEXT");
-const patrolColumns = new Set((db.prepare("PRAGMA table_info(patrols)").all() as { name: string }[]).map((column) => column.name));
-if (!patrolColumns.has("result")) db.exec("ALTER TABLE patrols ADD COLUMN result TEXT");
-if (!patrolColumns.has("recommendation_followed")) db.exec("ALTER TABLE patrols ADD COLUMN recommendation_followed INTEGER NOT NULL DEFAULT 0");
-const contestColumns = new Set((db.prepare("PRAGMA table_info(contests)").all() as { name: string }[]).map((column) => column.name));
-if (!contestColumns.has("evidence_name")) db.exec("ALTER TABLE contests ADD COLUMN evidence_name TEXT");
-if (!contestColumns.has("evidence_type")) db.exec("ALTER TABLE contests ADD COLUMN evidence_type TEXT");
-if (!contestColumns.has("evidence_data")) db.exec("ALTER TABLE contests ADD COLUMN evidence_data TEXT");
-db.exec("UPDATE occurrences SET status = 'Em análise' WHERE source = 'População' AND status IN ('Recebida', 'Informada')");
-db.exec("UPDATE occurrences SET status = 'Validação' WHERE source = 'População' AND status = 'Concluído'");
-
-function requireInstitutional() {
-  const user = currentSession();
+async function requireInstitutional() {
+  const user = await currentSession();
   if (!user || user.role !== "institutional") throw new Error("Acesso institucional necessário.");
   return user;
 }
 
-function requireRecordPermission(kind: RecordKind, mutation = false) {
-  const user = requireInstitutional();
+async function requireRecordPermission(kind: RecordKind, mutation = false) {
+  const user = await requireInstitutional();
   if (!mutation) return user;
   const agentKinds: RecordKind[] = ["occurrences", "predictions", "patrols", "recommendations", "ai_decisions"];
   const auditorKinds: RecordKind[] = ["predictions", "audits", "contests", "reports", "bias_alerts", "mitigations", "models", "data_quality"];
@@ -97,8 +65,8 @@ function requireRecordPermission(kind: RecordKind, mutation = false) {
   return user;
 }
 
-function requireCitizen() {
-  const user = currentSession();
+async function requireCitizen() {
+  const user = await currentSession();
   if (!user || user.role !== "citizen") throw new Error("Acesso da população necessário.");
   return user;
 }
@@ -111,11 +79,10 @@ function contestProtocol(id: string) {
   return `CT-${new Date().getFullYear()}-${id.replaceAll("-", "").slice(0, 8).toUpperCase()}`;
 }
 
-function createInstitutionalNotification(userId: string, title: string, region: string, eventDate: string, eventTime: string, details: string) {
-  db.prepare(`INSERT INTO notifications
+async function createInstitutionalNotification(userId: string, title: string, region: string, eventDate: string, eventTime: string, details: string) {
+  (await q(`INSERT INTO notifications
     (id,title,region,event_date,event_time,source,status,confidence,details,created_by)
-    VALUES (?,?,?,?,?,'População','Nova',0,?,?)`)
-    .run(randomUUID(), title, region, eventDate, eventTime, details, userId);
+    VALUES (?,?,?,?,?,'População','Nova',0,?,?)`, [randomUUID(), title, region, eventDate, eventTime, details, userId]));
 }
 
 function mapRow(row: Record<string, unknown>): ManagedRecord {
@@ -139,8 +106,8 @@ function mapRow(row: Record<string, unknown>): ManagedRecord {
   };
 }
 
-export function listRecords(kind: RecordKind) {
-  requireRecordPermission(kind);
+export async function listRecords(kind: RecordKind) {
+  await requireRecordPermission(kind);
   const query = kind === "occurrences"
     ? `SELECT occurrences.*, users.name AS reporter_name, users.email AS reporter_email, users.phone AS reporter_phone
        FROM occurrences JOIN users ON users.id = occurrences.created_by ORDER BY event_date DESC, occurrences.created_at DESC`
@@ -148,71 +115,67 @@ export function listRecords(kind: RecordKind) {
       ? `SELECT contests.*, users.name AS reporter_name, users.email AS reporter_email, users.phone AS reporter_phone
          FROM contests JOIN users ON users.id = contests.created_by ORDER BY event_date DESC, contests.created_at DESC`
       : `SELECT * FROM ${tables[kind]} ORDER BY event_date DESC, created_at DESC`;
-  return (db.prepare(query).all() as Record<string, unknown>[]).map(mapRow).map((item) => kind === "contests" ? { ...item, protocol: contestProtocol(item.id) } : item);
+  return ((await q(query)) as Record<string, unknown>[]).map(mapRow).map((item) => kind === "contests" ? { ...item, protocol: contestProtocol(item.id) } : item);
 }
 
-export function reviewContest(input: { id: string; decision: "Manter decisão" | "Alterar decisão" | "Cancelar decisão" | "Solicitar mais informações"; justification: string }) {
-  const user = requireInstitutional();
+export async function reviewContest(input: { id: string; decision: "Manter decisão" | "Alterar decisão" | "Cancelar decisão" | "Solicitar mais informações"; justification: string }) {
+  const user = await requireInstitutional();
   if (user.institutionalType !== "auditor") throw new Error("Somente auditores podem concluir revisões humanas.");
   const justification = input.justification.trim();
   if (!justification) throw new Error("Informe a justificativa da decisão humana.");
-  const current = db.prepare("SELECT details FROM contests WHERE id = ?").get(input.id) as { details: string } | undefined;
+  const current = (await q("SELECT details FROM contests WHERE id = ?", [input.id]))[0] as { details: string } | undefined;
   if (!current) throw new Error("Contestação não encontrada.");
   const status = input.decision === "Solicitar mais informações" ? "Aguardando informações" : "Revisão concluída";
   const auditText = `${current.details}\n\nDecisão humana: ${input.decision}. Justificativa: ${justification}. Auditor responsável: ${user.name}.`;
-  db.prepare("UPDATE contests SET status = ?, details = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(status, auditText, input.id);
-  db.prepare(`INSERT INTO audits (id,title,region,event_date,event_time,source,status,confidence,details,created_by)
-    SELECT ?, ?, region, date('now'), time('now'), 'Revisão humana', 'Registrado', 100, ?, ? FROM contests WHERE id = ?`)
-    .run(randomUUID(), `Revisão ${contestProtocol(input.id)}`, `${input.decision}. ${justification}`, user.id, input.id);
+  (await q("UPDATE contests SET status = ?, details = ?, updated_at = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?", [status, auditText, input.id]));
+  (await q(`INSERT INTO audits (id,title,region,event_date,event_time,source,status,confidence,details,created_by)
+    SELECT ?, ?, region, to_char(now(), 'YYYY-MM-DD'), to_char(now(), 'HH24:MI'), 'Revisão humana', 'Registrado', 100, ?, ? FROM contests WHERE id = ?`, [randomUUID(), `Revisão ${contestProtocol(input.id)}`, `${input.decision}. ${justification}`, user.id, input.id]));
   return { ok: true, status };
 }
 
-export function addRecord(kind: RecordKind, input: Omit<ManagedRecord, "id" | "createdBy" | "createdAt">) {
-  const user = requireRecordPermission(kind, true);
+export async function addRecord(kind: RecordKind, input: Omit<ManagedRecord, "id" | "createdBy" | "createdAt">) {
+  const user = await requireRecordPermission(kind, true);
   if (!input.title.trim()) throw new Error("Informe o título ou tipo do registro.");
   const id = randomUUID();
   if (kind === "patrols") {
-    db.prepare(`INSERT INTO patrols (id,title,region,event_date,event_time,source,status,confidence,details,created_by,result,recommendation_followed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, input.title.trim(), input.region.trim() || user.city, input.eventDate, input.eventTime, "Agente policial", input.status.trim() || "Realizado", 0, input.details.trim(), user.id, input.result?.trim() ?? "", input.recommendationFollowed ? 1 : 0);
+    (await q(`INSERT INTO patrols (id,title,region,event_date,event_time,source,status,confidence,details,created_by,result,recommendation_followed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, [id, input.title.trim(), input.region.trim() || user.city, input.eventDate, input.eventTime, "Agente policial", input.status.trim() || "Realizado", 0, input.details.trim(), user.id, input.result?.trim() ?? "", input.recommendationFollowed ? true : false]));
   } else {
-    db.prepare(`INSERT INTO ${tables[kind]} (id,title,region,event_date,event_time,source,status,confidence,details,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, input.title.trim(), input.region.trim() || "Salvador", input.eventDate, input.eventTime, input.source.trim() || "Institucional", input.status.trim() || "Pendente", Math.max(0, Math.min(100, input.confidence || 0)), input.details.trim(), user.id);
+    (await q(`INSERT INTO ${tables[kind]} (id,title,region,event_date,event_time,source,status,confidence,details,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)`, [id, input.title.trim(), input.region.trim() || "Salvador", input.eventDate, input.eventTime, input.source.trim() || "Institucional", input.status.trim() || "Pendente", Math.max(0, Math.min(100, input.confidence || 0)), input.details.trim(), user.id]));
   }
   return { ok: true };
 }
 
-export function updateRecord(kind: RecordKind, id: string, status: string) {
-  requireRecordPermission(kind, true);
-  db.prepare(`UPDATE ${tables[kind]} SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(status, id);
+export async function updateRecord(kind: RecordKind, id: string, status: string) {
+  await requireRecordPermission(kind, true);
+  (await q(`UPDATE ${tables[kind]} SET status = ?, updated_at = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?`, [status, id]));
   return { ok: true };
 }
 
-export function removeRecord(kind: RecordKind, id: string) {
-  requireRecordPermission(kind, true);
-  db.prepare(`DELETE FROM ${tables[kind]} WHERE id = ?`).run(id);
+export async function removeRecord(kind: RecordKind, id: string) {
+  await requireRecordPermission(kind, true);
+  (await q(`DELETE FROM ${tables[kind]} WHERE id = ?`, [id]));
   return { ok: true };
 }
 
-export function addCitizenOccurrence(input: { title: string; region: string; eventDate: string; eventTime: string; details: string; priority: string; evidenceName?: string; evidenceType?: string; evidenceData?: string; contactAuthorized: boolean; anonymous: boolean; latitude?: number; longitude?: number; city?: string; state?: string }) {
-  const user = requireCitizen();
+export async function addCitizenOccurrence(input: { title: string; region: string; eventDate: string; eventTime: string; details: string; priority: string; evidenceName?: string; evidenceType?: string; evidenceData?: string; contactAuthorized: boolean; anonymous: boolean; latitude?: number; longitude?: number; city?: string; state?: string }) {
+  const user = await requireCitizen();
   if (!input.title.trim() || !input.region.trim() || !input.eventDate) throw new Error("Preencha o tipo, o local e a data.");
   const id = randomUUID();
   if (input.evidenceData && input.evidenceData.length > 7_000_000) throw new Error("A evidência deve ter no máximo 5 MB.");
-  db.prepare(`INSERT INTO occurrences
+  (await q(`INSERT INTO occurrences
     (id,title,region,event_date,event_time,source,status,confidence,details,created_by,priority,evidence_name,evidence_type,evidence_data,contact_authorized,anonymous,latitude,longitude,city,state)
-    VALUES (?,?,?,?,?,'População','Em análise',0,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(id, input.title.trim(), input.region.trim(), input.eventDate, input.eventTime, input.details.trim(), user.id,
+    VALUES (?,?,?,?,?,'População','Em análise',0,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, input.title.trim(), input.region.trim(), input.eventDate, input.eventTime, input.details.trim(), user.id,
       input.priority === "Urgente" ? "Urgente" : "Normal", input.evidenceName ?? null, input.evidenceType ?? null,
-      input.evidenceData ?? null, input.contactAuthorized ? 1 : 0, input.anonymous ? 1 : 0,
+      input.evidenceData ?? null, input.contactAuthorized ? true : false, input.anonymous ? true : false,
       Number.isFinite(input.latitude) ? input.latitude : null, Number.isFinite(input.longitude) ? input.longitude : null,
-      input.city?.trim() || user.city, input.state?.trim() || user.state);
-  createInstitutionalNotification(user.id, "Nova ocorrência da população", input.region.trim(), input.eventDate, input.eventTime,
+      input.city?.trim() || user.city, input.state?.trim() || user.state]));
+  await createInstitutionalNotification(user.id, "Nova ocorrência da população", input.region.trim(), input.eventDate, input.eventTime,
     `${protocol(id)} · ${input.title.trim()} · Prioridade ${input.priority === "Urgente" ? "urgente" : "normal"}`);
   return { ok: true, protocol: protocol(id) };
 }
 
-export function addCitizenContest(input: { targetType: "occurrence" | "prediction"; reason: string; details: string; targetId?: string; evidenceName?: string; evidenceType?: string; evidenceData?: string }) {
-  const user = requireCitizen();
+export async function addCitizenContest(input: { targetType: "occurrence" | "prediction"; reason: string; details: string; targetId?: string; evidenceName?: string; evidenceType?: string; evidenceData?: string }) {
+  const user = await requireCitizen();
   if (!input.reason.trim() || !input.details.trim()) throw new Error("Informe o motivo e explique a contestação.");
   const id = randomUUID();
   const now = new Date();
@@ -220,44 +183,43 @@ export function addCitizenContest(input: { targetType: "occurrence" | "predictio
   const eventTime = now.toTimeString().slice(0, 5);
   const targetLabel = input.targetType === "prediction" ? "Previsão da IA" : "Decisão sobre ocorrência";
   if (input.evidenceData && input.evidenceData.length > 7_000_000) throw new Error("A evidência deve ter no máximo 5 MB.");
-  db.prepare(`INSERT INTO contests
+  (await q(`INSERT INTO contests
     (id,title,region,event_date,event_time,source,status,confidence,details,created_by,evidence_name,evidence_type,evidence_data)
-    VALUES (?,? ,?,?,?,?, 'Aguardando análise',0,?,?,?,?,?)`)
-    .run(id, `${targetLabel}: ${input.reason.trim()}`, user.city, eventDate, eventTime, "População", `${input.targetId ? `Registro contestado: ${input.targetId}. ` : ""}${input.details.trim()}`, user.id, input.evidenceName ?? null, input.evidenceType ?? null, input.evidenceData ?? null);
-  createInstitutionalNotification(user.id, "Nova contestação da população", user.city, eventDate, eventTime,
+    VALUES (?,? ,?,?,?,?, 'Aguardando análise',0,?,?,?,?,?)`, [id, `${targetLabel}: ${input.reason.trim()}`, user.city, eventDate, eventTime, "População", `${input.targetId ? `Registro contestado: ${input.targetId}. ` : ""}${input.details.trim()}`, user.id, input.evidenceName ?? null, input.evidenceType ?? null, input.evidenceData ?? null]));
+  await createInstitutionalNotification(user.id, "Nova contestação da população", user.city, eventDate, eventTime,
     `${contestProtocol(id)} · ${targetLabel} · ${input.reason.trim()}`);
   return { ok: true, protocol: contestProtocol(id) };
 }
 
-export function citizenDecisionRecords() {
-  const user = requireCitizen();
-  const ownOccurrences = (db.prepare("SELECT * FROM occurrences WHERE created_by = ? ORDER BY event_date DESC").all(user.id) as Record<string, unknown>[]).map(mapRow).map((item) => ({ ...item, kind: "occurrence" as const, protocol: protocol(item.id) }));
-  const predictions = (db.prepare("SELECT * FROM predictions ORDER BY event_date DESC").all() as Record<string, unknown>[]).map(mapRow).map((item) => ({ ...item, kind: "prediction" as const, protocol: `PR-${new Date().getFullYear()}-${item.id.replaceAll("-", "").slice(0, 8).toUpperCase()}` }));
+export async function citizenDecisionRecords() {
+  const user = await requireCitizen();
+  const ownOccurrences = ((await q("SELECT * FROM occurrences WHERE created_by = ? ORDER BY event_date DESC", [user.id])) as Record<string, unknown>[]).map(mapRow).map((item) => ({ ...item, kind: "occurrence" as const, protocol: protocol(item.id) }));
+  const predictions = ((await q("SELECT * FROM predictions ORDER BY event_date DESC", [])) as Record<string, unknown>[]).map(mapRow).map((item) => ({ ...item, kind: "prediction" as const, protocol: `PR-${new Date().getFullYear()}-${item.id.replaceAll("-", "").slice(0, 8).toUpperCase()}` }));
   return [...ownOccurrences, ...predictions].sort((a, b) => `${b.eventDate}${b.eventTime}`.localeCompare(`${a.eventDate}${a.eventTime}`));
 }
 
-export function myCitizenContests() {
-  const user = requireCitizen();
-  return (db.prepare("SELECT * FROM contests WHERE created_by = ? ORDER BY event_date DESC, created_at DESC").all(user.id) as Record<string, unknown>[]).map(mapRow).map((item) => ({ ...item, protocol: contestProtocol(item.id) }));
+export async function myCitizenContests() {
+  const user = await requireCitizen();
+  return ((await q("SELECT * FROM contests WHERE created_by = ? ORDER BY event_date DESC, created_at DESC", [user.id])) as Record<string, unknown>[]).map(mapRow).map((item) => ({ ...item, protocol: contestProtocol(item.id) }));
 }
 
-export function publicTransparency() {
-  const count = (table: string) => Number((db.prepare(`SELECT COUNT(*) AS total FROM ${table}`).get() as { total: number }).total);
-  const corrections = Number((db.prepare("SELECT COUNT(*) AS total FROM contests WHERE status LIKE '%conclu%' OR details LIKE '%Alterar decisão%' OR details LIKE '%Cancelar decisão%'").get() as { total: number }).total);
-  const limitations = (db.prepare("SELECT title, details, status FROM data_quality ORDER BY event_date DESC LIMIT 6").all() as Array<{ title: string; details: string; status: string }>);
-  return { analyses: count("predictions"), humanReviews: count("audits"), contests: count("contests"), corrections, biasAlerts: count("bias_alerts"), mitigations: count("mitigations"), limitations };
+export async function publicTransparency() {
+  const count = async (table: string) => Number(((await q(`SELECT COUNT(*) AS total FROM ${table}`, []))[0] as { total: number }).total);
+  const corrections = Number(((await q("SELECT COUNT(*) AS total FROM contests WHERE status LIKE '%conclu%' OR details LIKE '%Alterar decisão%' OR details LIKE '%Cancelar decisão%'", []))[0] as { total: number }).total);
+  const limitations = ((await q("SELECT title, details, status FROM data_quality ORDER BY event_date DESC LIMIT 6", [])) as Array<{ title: string; details: string; status: string }>);
+  return { analyses: await count("predictions"), humanReviews: await count("audits"), contests: await count("contests"), corrections, biasAlerts: await count("bias_alerts"), mitigations: await count("mitigations"), limitations };
 }
 
-export function myCitizenOccurrences() {
-  const user = requireCitizen();
-  return (db.prepare("SELECT * FROM occurrences WHERE created_by = ? ORDER BY event_date DESC, created_at DESC").all(user.id) as Record<string, unknown>[])
+export async function myCitizenOccurrences() {
+  const user = await requireCitizen();
+  return ((await q("SELECT * FROM occurrences WHERE created_by = ? ORDER BY event_date DESC, created_at DESC", [user.id])) as Record<string, unknown>[])
     .map(mapRow)
     .map((item) => ({ ...item, protocol: protocol(item.id) }));
 }
 
-export function myCitizenAlerts() {
-  const user = requireCitizen();
-  const occurrenceAlerts = (db.prepare("SELECT * FROM occurrences WHERE created_by = ?").all(user.id) as Record<string, unknown>[]).map(mapRow).map((item) => ({
+export async function myCitizenAlerts() {
+  const user = await requireCitizen();
+  const occurrenceAlerts = ((await q("SELECT * FROM occurrences WHERE created_by = ?", [user.id])) as Record<string, unknown>[]).map(mapRow).map((item) => ({
     id: item.id,
     type: "Ocorrência atualizada",
     text: `Ocorrência “${item.title}” está com o status: ${item.status}.`,
@@ -268,7 +230,7 @@ export function myCitizenAlerts() {
     kind: "occurrence" as const,
     protocol: protocol(item.id),
   }));
-  const contestAlerts = (db.prepare("SELECT * FROM contests WHERE created_by = ?").all(user.id) as Record<string, unknown>[]).map(mapRow).map((item) => ({
+  const contestAlerts = ((await q("SELECT * FROM contests WHERE created_by = ?", [user.id])) as Record<string, unknown>[]).map(mapRow).map((item) => ({
     id: item.id,
     type: "Contestação atualizada",
     text: `Contestação “${item.title}” está com o status: ${item.status}.`,
@@ -282,10 +244,10 @@ export function myCitizenAlerts() {
   return [...occurrenceAlerts, ...contestAlerts].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
-export function citizenDashboard() {
-  const user = currentSession();
+export async function citizenDashboard() {
+  const user = await currentSession();
   if (!user || user.role !== "citizen") throw new Error("Acesso da população necessário.");
-  const allRows = (db.prepare("SELECT * FROM occurrences ORDER BY event_date DESC").all() as Record<string, unknown>[]).map(mapRow);
+  const allRows = ((await q("SELECT * FROM occurrences ORDER BY event_date DESC", [])) as Record<string, unknown>[]).map(mapRow);
   const rows = user.neighborhood
     ? allRows.filter((item) => item.region.localeCompare(user.neighborhood!, "pt-BR", { sensitivity: "base" }) === 0)
     : allRows;
@@ -329,10 +291,10 @@ const salvadorRegions: Record<string, [number, number]> = {
 };
 
 export type MapFilterInput = { period?: string; type?: string; time?: string; weekday?: string; source?: string; status?: string; confidence?: string };
-export function heatmapData(filters: MapFilterInput = {}) {
-  const user = currentSession();
+export async function heatmapData(filters: MapFilterInput = {}) {
+  const user = await currentSession();
   if (!user) throw new Error("Sessão necessária.");
-  const allRows = (db.prepare("SELECT * FROM occurrences ORDER BY event_date DESC").all() as Record<string, unknown>[]).map(mapRow);
+  const allRows = ((await q("SELECT * FROM occurrences ORDER BY event_date DESC", [])) as Record<string, unknown>[]).map(mapRow);
   const cutoffDays = filters.period === "Últimos 7 dias" ? 7 : filters.period === "3 meses" ? 90 : filters.period === "12 meses" ? 365 : 30;
   const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - cutoffDays);
   const weekdayNames = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
