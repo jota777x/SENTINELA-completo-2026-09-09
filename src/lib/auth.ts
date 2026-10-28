@@ -24,7 +24,7 @@ export const sessionFn = createServerFn({ method: "GET" }).handler(async () => {
 
 export const logoutFn = createServerFn({ method: "POST" }).handler(async () => {
   const { endSession } = await import("./auth.server");
-  endSession();
+  await endSession();
   return { ok: true };
 });
 export const accessibilityPreferencesFn = createServerFn({ method: "GET" }).handler(async () => {
